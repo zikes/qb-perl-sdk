@@ -1,35 +1,11 @@
-#################################################################################
-#                           QuickBase Client for Perl                           #
-#                           -------------------------                           #
-#                                                                               #
-# Copyright (C) 2011 by Jason Hutchinson                                        #
-#                                                                               #
-# Permission is hereby granted, free of charge, to any person obtaining a copy  #
-# of this software and associated documentation files (the "Software"), to deal #
-# in the Software without restriction, including without limitation the rights  #
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell     #
-# copies of the Software, and to permit persons to whom the Software is         #
-# furnished to do so, subject to the following conditions:                      #
-#                                                                               #
-# The above copyright notice and this permission notice shall be included in    #
-# all copies or substantial portions of the Software.                           #
-#                                                                               #
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR    #
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,      #
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE   #
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER        #
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, #
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN     #
-# THE SOFTWARE.                                                                 #
-#################################################################################
-
 package HTTP::QuickBase;
 
 use strict;
 use LWP::UserAgent;
 use MIME::Base64 qw(encode_base64);
+use Data::Dumper;
 
-my %xml_escapes; 
+my %xml_escapes;
 
 my $VERSION = sprintf "%d.%03d", q$Revision: 2.001 $ =~ /: (\d+)\.(\d+)/;
 
@@ -43,16 +19,18 @@ sub new{
     }
 
     $self = bless {
-        'url_prefix' => $prefix || "https://www.quickbase.com/db" ,
-        'ticket' => undef,
-        'apptoken' => "",
-        'error' => undef,
-        'errortext' => undef,
-        'username' => undef,
-        'password' => undef,
-        'credentials' => undef,
-        'proxy' => undef,
-        'realmhost' => undef
+        'url_prefix'    => $prefix || "https://www.quickbase.com/db",
+        'ticket'        => undef,
+        'apptoken'      => "",
+        'apptokens'     => {},
+        'tmp_apptoken'  => undef,
+        'error'         => undef,
+        'errortext'     => undef,
+        'username'      => undef,
+        'password'      => undef,
+        'credentials'   => undef,
+        'proxy'         => undef,
+        'realmhost'     => undef
         }, $class;
 }
 
@@ -73,7 +51,7 @@ sub add_record{
             my $att_key = $key =~ /[^0-9]/ ? "name" : "fid";
             ( my $att_val = lc($key) ) =~ s/[^a-z0-9]/_/g;
             push @record, {
-                tag   => "field", 
+                tag   => "field",
                 atts  => {$att_key => $att_val},
                 value => $data->{$key}
             };
@@ -90,7 +68,7 @@ sub add_replace_db_page{
     if(ref($pageid) eq "HASH"){
         $res = $self->post_api($db, "API_AddReplaceDBPage", $pageid);
     }else{
-        if($pageid =~ m{^\d$}){ # Editing
+        if($pageid =~ m{^\d+$}){ # Editing
             $res = $self->post_api($db, "API_AddReplaceDBPage", {pageid => $pageid, pagetype => $pagetype, pagebody => $pagebody});
         }else{ #Adding
             $res = $self->post_api($db, "API_AddReplaceDBPage", {pageid => $pageid, pagename => $pagename, pagetype => $pagetype, pagebody => $pagebody});
@@ -99,7 +77,34 @@ sub add_replace_db_page{
     return between(lc($res->content), "<pageid>", "</pageid>");
 }
 
-sub apptoken{my ($self,$apptoken) = @_;$self->{'apptoken'} = $apptoken || $self->{'apptoken'};}
+sub apptoken{
+    my ($self,$apptoken,@for_dbids) = @_;
+    if(@for_dbids){
+        foreach my $dbid(@for_dbids){
+            $self->apptoken_map({$dbid=>$apptoken});
+        }
+        return $self;
+    }
+    $self->{'apptoken'} = $apptoken if defined($apptoken);
+    return $self->{'apptoken'};
+}
+sub apptokens{my $self = shift;$self->apptoken(@_);}
+
+sub apptoken_map{
+    my ($self,$map) = @_;
+    if(ref($map) eq "HASH"){
+        foreach my $dbid(keys %{$map}){
+            $self->{'apptokens'}->{$dbid}=$map->{$dbid};
+        }
+    }else{
+        my @lines=split(/\n/,$map);
+        foreach my $line(@lines){
+            my ($dbid,$apptoken) = split(/,/,$line);
+            $self->{'apptokens'}->{$dbid}=$apptoken;
+        }
+    }
+    return 1;
+}
 
 sub authenticate ($$){
     my ($self,$u,$p) = @_;
@@ -120,7 +125,10 @@ sub get_ticket{
     my ($self,$u,$p) = @_;
     $u=$u || $self->{'username'};
     $p=$p || $self->{'password'};
-    return [$self->post_api("main", "API_Authenticate", {username=>$u, password=>$p})->content =~ /<ticket>(.+)<\/ticket>/i]->[0] || "";
+    my $c=$self->post_api("main", "API_Authenticate", {username=>$u, password=>$p})->content;
+    my $ticket=[$c =~ /<ticket>(.+)<\/ticket>/i]->[0] || "";
+    $self->{'userid'}=[$c =~ /<userid>(.+)<\/userid>/i]->[0] || "";
+    return $ticket;
 }
 
 sub proxy{my ($self, $proxy) = @_;$self->{'proxy'} = $proxy || $self->{'proxy'};}
@@ -145,15 +153,22 @@ sub url_prefix{
 sub post_api{
     my $self=shift;
     my ($db, $action, $params, $headers)=@_;
-    
+
+    if(defined($self->{'apptokens'}->{$db}) && !defined($self->{'tmp_apptoken'})){
+        $self->{'tmp_apptoken'}=$self->apptoken();
+        $self->apptoken($self->{'apptokens'}->{$db});
+    }
+
     my $process_param = sub {
         my ($tag,$value,$atts) = @_;
-        
+
+        # if($self->{'debug'}){print "--------\nTag: ".Dumper($tag)."\nValue: ".Dumper($value)."\nAtts: ".Dumper($atts)."\n";}
+
         $tag = $tag || "field";
-        
+
         # Handle file attachments
-        if($atts->{filename} or $atts->{file}){
-            my $file = $atts->{filename} || $atts->{file};
+        if($atts->{filename} or $atts->{file} or (ref($value) eq 'ARRAY' and $value->[0] eq 'file')){
+            my $file = $atts->{filename} || $atts->{file} || $value->[1];
             my $filename = "";
             my $buffer   = "";
             if($file =~ /[\\\/]([^\/\\]+)$/){
@@ -161,7 +176,8 @@ sub post_api{
             }else{
                 $filename=$file;
             }
-            
+            $value = '';
+
             unless(open(FORUPLOADTOQUICKBASE, "<$file")){
                 $value = encode_base64("Sorry QuickBase could not open the file '$file' for input, for upload to this field in this record.", "")
             }
@@ -178,14 +194,14 @@ sub post_api{
         # ARRAY type
         return "<$tag".
         (scalar(keys %{$atts}) ? ' ' : '').
-        join(" ", map {$self->xml_escape($_).'="'.$self->xml_escape($atts->{$_}).'"'} keys %{$atts}).
+        join(" ", map {$self->xml_escape($_).'="'.$self->xml_escape($atts->{$_}).'"'} sort {$a eq 'name' or $a eq 'fid' ? -1 : $b eq 'name' or $b eq 'fid' ? 1 : 0} keys %{$atts}).
         ">".$self->xml_escape($value)."</$tag>";
     };
-    
+
     # Set default headers
     $headers->{'QUICKBASE-ACTION'}=($action || $headers->{action} || $headers->{'QUICKBASE-ACTION'});
     $headers->{'Content-Type'}=($headers->{'Content-Type'} || $headers->{'content-type'} || $headers->{'Content-type'} || 'text/xml');
-    
+
     foreach my $header(qw(Content-type content-type action)){
         delete $headers->{"$header"};
     }
@@ -199,22 +215,22 @@ sub post_api{
         # If so, have our UserAgent use the proxy for both HTTP and HTTPS requests
         $ua->proxy(['http','https'], $self->{'proxy'});
     }
-    
+
     # Create a new HTTP Request object
     my $req = new HTTP::Request;
     $req->method('POST');
-    
+
     # Has the user defined a realm?
     $req->uri($self->url_prefix().($self->{'realmhost'} ? "/$db?realmhost=$self->{'realmhost'}" : "/$db"));
-    
+
     # Tell the server what kind of information to expect
     $req->content_type('text/xml');
-    
+
     # Set the request headers (including the QB API action)
     while( my ($k, $v) = each %{$headers}){
         $req->header("$k" => "$v");
     }
-    
+
     # Create the XML content of the request
     my $content="<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n".
             "<qdbapi>\n".
@@ -234,23 +250,23 @@ sub post_api{
                     )
                 ).
             "</qdbapi>\n";
-    
+
     if($self->{'debug'}){
         open(XML, ">C:/request.txt");
         print XML $content;
         close(XML);
     }
-    
+
     $req->content($content);
-    
+
     my $response = $ua->request($req);
-    
+
     if($self->{'debug'}){
         open(XML, ">C:/response.txt");
         print XML $response->content;
         close(XML);
     }
-    
+
     if($response->is_error()){
         if($response->code == 500){
             if(defined($self->{'retries'}) && $self->{'retries'}>5){
@@ -264,16 +280,21 @@ sub post_api{
             print $response->code." ".$response->message."\n";
         }
     }
-    
+
     $self->{'retries'}=0;
-    
+
     $self->{'error'} = between($response->content, "<errcode>", "</errcode>");
     $self->{'errortext'} = between($response->content, "<errdetail>", "</errdetail>") || between($response->content, "<errtext>", "</errtext>");
-    
+
     if($self->{'error'} ne "0" and $self->{'error'} ne ""){
         print between($response->content, "<action>","</action>")." - Error ".$self->{'error'}.": ".$self->{'errortext'}."\n";
     }
-    
+
+    if(defined($self->{'tmp_apptoken'})){
+        $self->apptoken($self->{'tmp_apptoken'});
+        $self->{'tmp_apptoken'}=undef;
+    }
+
     return $response;
 }
 
@@ -306,8 +327,12 @@ sub delete_record{
     my ($self, $db, $rid) = @_;
     return $self->post_api($db, "API_DeleteRecord", {rid=>$rid})->content =~ m{<errcode>0</errcode>}i;
 }
+sub do_query_count{
+    my ($self, $db, $query) = @_;
+    return between(lc($self->post_api($db, "API_DoQueryCount", {query=>$query})->content),"<nummatches>","</nummatches>");
+}
 
-# Because API_FieldAddChoices and API_FieldRemoveChoices are so similar, they 
+# Because API_FieldAddChoices and API_FieldRemoveChoices are so similar, they
 # are combined into a "private" subroutine for ease.
 sub _field_choices{
     my ($self, $db, $fid, $choices, $addremove) = @_;
@@ -315,7 +340,7 @@ sub _field_choices{
     push(@params, {tag=>"fid", value=>$fid});
     foreach my $choice(@{$choices}){push(@params, {tag=>"choice", value=>$choice})}
     my ($ar_tag, $api)=($addremove>0?("numadded", "API_FieldAddChoices"):("numremoved", "API_FieldRemoveChoices"));
-    return between($self->post_api($db, $api, \@params)->content, "<numadded>","</numadded>");
+    return between($self->post_api($db, $api, \@params)->content, "<$ar_tag>","</$ar_tag>");
 }
 
 sub field_add_choices{my ($self, $db, $fid, $choices) = @_;return $self->_field_choices($db,$fid,$choices,1);}
@@ -332,31 +357,37 @@ sub gen_add_record_form{
 
 sub gen_results_table{
     my ($self, $db, $query, $clist, $slist, $jht, $jsa, $options) = @_;
-    
+
+    my %hash;
+
+
+
     if(ref($query) eq "HASH"){
-        return $self->post_api($db, "API_GenAddRecordForm", {
-            query=>$query->{query}, 
-            clist=>$query->{clist}, 
-            slist=>$query->{slist},
-            jht=>$query->{jht}, 
-            jsa=>$query->{jsa}, 
-            options=>$query->{options}
-        })->content;
+        $hash{'query'} = $query->{query} if defined($query->{query});
+        $hash{'clist'} = $query->{clist} if defined($query->{clist});
+        $hash{'slist'} = $query->{slist} if defined($query->{slist});
+        $hash{'jht'} = $query->{jht} if defined($query->{jht});
+        $hash{'jsa'} = $query->{jsa} if defined($query->{jsa});
+        $hash{'options'} = $query->{options} if defined($query->{options});
     }else{
-        return $self->post_api($db, "API_GenAddRecordForm", {
-            query=>$query, clist=>$clist, slist=>$slist,
-            jht=>$jht, jsa=>$jsa, options=>$options
-        })->content;
+        $hash{'query'} = $query if defined($query);
+        $hash{'clist'} = $clist if defined($clist);
+        $hash{'slist'} = $slist if defined($slist);
+        $hash{'jht'} = $jht if defined($jht);
+        $hash{'jsa'} = $jsa if defined($jsa);
+        $hash{'options'} = $options if defined($options);
     }
+
+    return $self->post_api($db, "API_GenResultsTable", \%hash)->content;
 }
 
 sub get_db_info{
     my ($self, $db) = @_;
-    
+
     my $res = $self->post_api($db, "API_GetDBInfo", {})->content;
-    
+
     my %db_info;
-    
+
     foreach my $key(qw(dbname version lastRecModTime lastModifiedTime createdTime numRecords mgrID mgrName)){
         $db_info{$key}=between($res, "<$key>", "</$key>");
     }
@@ -392,21 +423,21 @@ sub get_record_info{
 sub get_record{
     my ($self, $db, $rid) = @_;
     my $res = $self->get_record_info($db, $rid);
-    
+
     my %record;
-    
+
     $record{'rid'}        = between($res, "<rid>", "</rid>");
     $record{'num_fields'} = between($res, "<num_fields>", "</num_fields>");
     $record{'update_id'}  = between($res, "<update_id>", "</update_id>");
-    
+
     my @fields = $res=~ /<field>(.+?)<\/field>/isg;
-    
+
     foreach my $field(@fields){
         my %field = $field =~ m{<([^>]+)>(.+?)</\1>}ig;
         $record{$field{name}}=\%field;
         $record{"f_".$field{fid}}=\%field;
     }
-    
+
     return \%record;
 }
 
@@ -436,12 +467,12 @@ sub get_role_info{
 sub get_schema{
     my ($self, $db) = @_;
     my $res=$self->post_api($db, "API_GetSchema", {})->content;
-    
+
     my %table;
     foreach my $key(qw(name desc table_id cre_date mod_date next_record_id next_field_id next_query_id def_sort_fid def_sort_order)){
         $table{$key}=between($res, "<$key>", "</$key>");
     }
-    
+
     $table{variables}={};
     my $vars = between($res, "<variables>", "</variables>");
     foreach my $var(@{[$vars =~ /(<var .+?<\/var>)/isg]}){
@@ -449,39 +480,39 @@ sub get_schema{
     }
     $table{queries}={};
     $table{queries}=process_queries_xml(between($res, "<queries>", "</queries>",0,1));
-    
+
     $table{fields}={};
     $table{fields} =process_fields_xml(between($res, "<fields>", "</fields>",0,1));
-    
+
     $table{chdbids}={};
     my $chdbids = between($res, "<chdbids>", "</chdbids>");
     foreach my $chdbid(@{[$chdbids =~ /(<chdbid .+?<\/chdbid>)/isg]}){
         my $chdbid_name=between($chdbid, "<chdbid name=\"","\"");
         my $chdbid_dbid=between($chdbid, ">", "<");
-        
+
         $table{chdbids}{$chdbid_name}=$chdbid_dbid if $chdbid_name;
     }
-    
+
     return \%table;
 }
 
 sub get_dtm_info{
     my ($self, $dbid) = @_;
     my $res = $self->post_api($dbid, "API_GetAppDTMInfo")->content;
-    
+
     my %info=(
         "RequestTime" => between($res, "<RequestTime>","</RequestTime>"),
         "RequestNextAllowedTime" => between($res, "<RequestNextAllowedTime>","</RequestNextAllowedTime>"),
         "tables" => ()
     );
-    
+
     if($res =~ m{<app id=}){
         my $app=between($res, '<app id="', "</app>", 1);
         $info{'app_id'}=between($app, '<app id="', '"');
         $info{'lastModifiedTime'}=between($app,"<lastModifiedTime>","</lastModifiedTime>");
         $info{'lastRecModTime'}=between($app,"<lastRecModTime>","</lastRecModTime>");
     }
-    
+
     foreach my $table([$res =~ m{(<table.+?</table>)}isg]){
         push(@{$info{'tables'}}, {
             "table_id"         => between($table, '<table id="','">'),
@@ -489,20 +520,20 @@ sub get_dtm_info{
             "lastRecModTime"   => between($table,"<lastRecModTime>","</lastRecModTime>")
         });
     }
-    
+
     return %info;
 }
 
 sub get_user_info{
     my ($self, $user) = @_;
     my $res = $self->post_api("main", "API_GetUserInfo", {email=>$user})->content;
-    
+
     my %user_info;
     $user_info{id}=between($res, '<user id="', '">');
     foreach my $key(qw(firstName lastName login email screenName isVerified externalAuth)){
         $user_info{$key}=between($res, "<$key>", "</$key>");
     }
-    
+
     return \%user_info;
 }
 
@@ -518,20 +549,20 @@ sub get_user_roles{
 
 sub granted_dbs{
     my ($self, $include_parents, $include_children, $admin_only) = @_;
-    
+
     my %params=();
-    
+
     $params{'Excludeparents'}=($include_parents ? 0 : 1);
     $params{'withembeddedtables'}=($include_children ? 1 : 0);
     $params{'adminOnly'}=1 if $admin_only;
-    
+
     my @databases = map {
         {
             "dbname" => between($_, "<dbname>", "</dbname>"),
             "dbid" => between($_, "<dbid>", "</dbid>")
         }
     } $self->post_api("main", "API_GrantedDBs", \%params)->content =~ m{<dbinfo>(.+?)</dbinfo>}sig;
-    
+
     return @databases;
 }
 
@@ -570,7 +601,7 @@ sub user_roles{
     my $res=$self->post_api($db, "API_UserRoles", {})->content;
     my @output_users;
     my @users = $res =~ /(<user id.+?<\/user>)/isg;
-    
+
     foreach my $user(@users){
         my @roles = $user =~ /<roles>(.+)<\/roles>/isg;
         $user =~ s/<roles>.+<\/roles>//isg;
@@ -579,7 +610,7 @@ sub user_roles{
             name=> [$user=~/<name>(.+)<\/name>/i]->[0],
             roles=> [
                 map {
-                    my $role=$_; 
+                    my $role=$_;
                     return {
                         id=>[$role=~/role id="(\d+)"/i]->[0],
                         name=>[$role=~/<name>(.+)<\/name>/i]->[0],
@@ -633,16 +664,16 @@ sub get_file{
     my ($self, $db, $rid, $fid, $version) = @_;
     my $prefix = $self->url_prefix();
     $prefix =~ s{/db$}{/up};
-    
+
     $version = $version || 0;
-    
+
     unless($self->{'ticket'}){
         $self->{'ticket'} = $self->get_ticket();
     }
-    
+
     my $ua = new LWP::UserAgent;
        $ua->agent("QuickBasePerlAPI/$VERSION");
-    
+
     if($self->proxy){
         $ua->proxy(['http','https'], $self->proxy);
     }
@@ -654,15 +685,15 @@ sub get_file{
        $req->uri($uri);
        $req->header('Accept' => '*/*');
        $req->header('Content-Length' => '0');
-       
+
     my $res = $ua->request($req);
-    
+
     if($res->is_error){
         $self->error($res->code);
         $self->errortext($res->message);
         return ("Error: ".$res->code." ".$res->message, $res->headers);
     }
-    
+
     return ($res->content, $res->headers);
 }
 
@@ -776,7 +807,7 @@ sub find_db_by_name{
 sub clone_database{
     my ($self, $db, $name, $desc, $keep_data, $exclude_files)=@_;
     $self->post_api("$db", "API_CloneDatabase", {
-        newdbname=>$name, 
+        newdbname=>$name,
         newdbdesc=>$desc,
         keepdata=>$keep_data,
         excludefiles=>$exclude_files
@@ -790,7 +821,7 @@ sub create_database{
     my $content=$self->post_api("main", "API_CreateDatabase", {dbname=>$name, dbdesc=>$desc, createapptoken=>$create_apptoken})->content;
 
     return (
-        dbid=>between($content, "<dbid>","</dbid>"), 
+        dbid=>between($content, "<dbid>","</dbid>"),
         appdbid=>between($content, "<appdbid>","</appdbid>"),
         apptoken=>between($content, "<apptoken>","</apptoken>")
     );
@@ -799,7 +830,7 @@ sub create_database{
 sub add_field{
     my ($self, $db, $label, $inp_type, $mode)=@_;
     my $type;
-    
+
     $type = "checkbox"  if $inp_type =~ m{checkbox|check|cb|check box|check-box}i;
     $type = "dblink"    if $inp_type =~ m{dblink|databaselink|database link|database-link}i;
     $type = "date"      if $inp_type =~ m{date}i;
@@ -813,7 +844,7 @@ sub add_field{
     $type = "text"      if $inp_type =~ m{text}i;
     $type = "timeofday" if $inp_type =~ m{timeofday|time of day|time}i;
     $type = "url"       if $inp_type =~ m{url|link|uri}i;
-    
+
     my $content=$self->post_api($db, "API_AddField", {label=>$label, type=>$type, mode=>$mode})->content;
 
     return between($content, "<fid>", "</fid>");
@@ -833,7 +864,7 @@ sub set_field_properties{
 # $query can be a scalar value or hash reference
 sub purge_records{
     my ($self, $db, $query)=@_;
-    
+
     unless(ref($query)){
         if($query =~ m/^\{.*\}$/){
             $query={query=>$query};
@@ -843,7 +874,7 @@ sub purge_records{
             $query={qname=>$query};
         }
     }
-    
+
     return between($self->post_api($db, "API_PurgeRecords", $query)->content, "<num_records_deleted>","</num_records_deleted>");
 }
 
@@ -873,55 +904,55 @@ sub do_query{
     }
 
     my $result = $self->post_api($db, "API_DoQuery", \%params)->content;
-    
+
     if(lc($fmt) eq "structured"){
         my @keys=qw(action errcode errtext qid qname name desc table_id app_id cre_date mod_date next_record_id next_field_id next_query_id def_sort_fid def_sort_order lastluserid);
-        
+
         foreach my $key(@keys){
             $response{$key}=between($result, "<$key>", "</$key>") if index($result, "<$key>")>-1;
         }
 
         ########################################################
         ##                       FIELDS                       ##
-        ########################################################        
+        ########################################################
 
         $response{fields} = process_fields_xml(between($result,"<fields>","</fields>",0,1));
-        
+
         ########################################################
         ##                      QUERIES                       ##
-        ########################################################        
+        ########################################################
 
         $response{queries} = process_queries_xml(between($result,"<queries>","</queries>",0,1));
 
         #########################################################
         ##                        USERS                        ##
-        #########################################################        
-        
+        #########################################################
+
         $response{users}=();
-        
+
         my @users = split "\r\n", between($result, "<lusers>", "</lusers>");
         shift(@users);
-        
+
         foreach my $user(@users){
             $response{users}{between($user, '"', '"')}=between($user, "\">", "</");
         }
-       
+
         #########################################################
         ##                       RECORDS                       ##
         #########################################################
-        
+
         my @records = split "</record>", between($result, "<records>", "</records>");
         pop(@records);
-                
+
         foreach my $record(@records){
             my %rec=(update_id=>between($record, "<update_id>", "</update_id>"));
-            
+
             foreach my $id(keys %{$response{fields}{by_id}}){
                 my $val="";
                 unless($record =~ m{<f id="$id"/>}i){
                     $val=between($record, "<f id=\"$id\">", "</f>");
                 }
-                
+
                 $rec{"f_$id"}=$self->xml_unescape($val);
                 $rec{$response{fields}{by_id}{$id}{label}}=$self->xml_unescape($val);
             }
@@ -933,22 +964,22 @@ sub do_query{
         foreach my $key(@keys){
             $response{$key}=between($result, "<$key>", "</$key>")  if index($result, "<$key>")>-1;
         }
-        
+
         my @records = $result =~ /<record>(.+?)<\/record>/gs;
-        
+
         foreach my $record(@records){
             my %rec;
             my @fields = $record =~ /<([^>]+)>([^<]+)<\/[^>]+>/g;
             my @fieldsets;
             push @fieldsets, [splice @fields, 0, 2] while @fields;
-            
+
             foreach my $fieldset(@fieldsets){
                 $rec{@{$fieldset}[0]}=@{$fieldset}[1];
             }
             push(@{$response{records}}, \%rec);
         }
     }
-    
+
     return(wantarray() ? @{$response{records}||()} : \%response);
 }
 
@@ -970,10 +1001,10 @@ sub edit_record{
 
 sub edit_record_with_update_id{
     my ($self, $db, $rid, $uid, $fields) = @_;
-    
+
     my @params=({tag=>"rid", value=>$rid});
     if($uid){push(@params, {tag=>"update_id", value=>$uid});}
-    
+
     if(ref($fields) eq "ARRAY"){
         foreach my $field(@{$fields}){
             foreach my $att(qw(name fid)){
@@ -987,13 +1018,13 @@ sub edit_record_with_update_id{
             push(@params,{tag=>"field", atts=>{($field=~m/^\d+$/?"fid":"name")=>$field}, value=>$value});
         }
     }
-    
+
     my $content=$self->post_api($db, "API_EditRecord", \@params)->content;
-    
+
     if($self->error ne '0'){
         return 0;
     }
-    
+
     return (
         num_fields_changed => between($content, "<num_fields_changed>","</num_fields_changed>"),
         update_id          => between($content, "<update_id>", "</update_id>"),
@@ -1018,9 +1049,9 @@ sub GetNextField ($$$$){
     my $endofdata = length($$datapointer);
     my $false=0;
     my $true=1;
-    
+
     $$fieldpointer = "";
-    
+
     while ($true){
         if ($p >= $endofdata){
             # File, line and field are done
@@ -1029,7 +1060,7 @@ sub GetNextField ($$$$){
         }
 
         $c = substr($$datapointer, $p, 1);
-    
+
         if($state == $DOUBLE_QUOTE_TEST)
             {
             # These checks are ordered by likelihood */
@@ -1100,7 +1131,7 @@ sub GetNextField ($$$$){
                 $$fieldpointer.=$c;
                 $p++;
             }
-        }   
+        }
     }
 }
 
@@ -1113,7 +1144,7 @@ sub GetNextLine ($$$$$$){
     # skip any empty lines
     while(
         $$offsetpointer < length($$data)
-        && 
+        &&
         (
             substr($$data, $$offsetpointer, 1) eq "\r"
             ||
@@ -1122,11 +1153,11 @@ sub GetNextLine ($$$$$$){
     ){
         $$offsetpointer++;
     }
-    
+
     if ($$offsetpointer >= length($$data)){
         return $false;
     }
-    
+
     $$lineIsEmptyPtr = $true;
     my $moreToCome;
     do{
@@ -1161,7 +1192,7 @@ sub ParseDelimited ($$){
             }
         }
     }
-        
+
     # If there are any lines which are shorter than the longest
     # lines, fill them out with "" entries here. This simplifies
     # checking later.
@@ -1170,7 +1201,7 @@ sub ParseDelimited ($$){
             push (@$i, "");
         }
     }
-        
+
     return @output;
 }
 
@@ -1195,11 +1226,11 @@ sub process_fields_xml{
             role=>$role,
             mode=>$mode
         };
-        
+
         foreach my $key(qw(
-                label nowrap bold required appears_by_default find_enabled allow_new_choices sort_as_given 
-                carrychoices foreignkey unique doesdatacopy fieldhelp display_user default_kind num_lines 
-                append_only allowHTML has_extension max_versions see_versions use_new_window comma_start 
+                label nowrap bold required appears_by_default find_enabled allow_new_choices sort_as_given
+                carrychoices foreignkey unique doesdatacopy fieldhelp display_user default_kind num_lines
+                append_only allowHTML has_extension max_versions see_versions use_new_window comma_start
                 does_average does_total blank_is_zero
             )){
             $response{by_id}{$id}{$key}=between($field, "<$key>", "</$key>");
@@ -1211,18 +1242,19 @@ sub process_fields_xml{
 }
 
 sub process_queries_xml{
-    my $xml=shift;    
-    my %response;    
-    my @queries = split "</query>", between($xml, "<queries>","</queries>");    
+    my $xml=shift;
+    my %response;
+    my @queries = split "</query>", between($xml, "<queries>","</queries>");
     pop(@queries);
     foreach my $query(@queries){
         my ($id) = $query =~ /<query.*id="(\d+)"/i;
+        next unless $id && $response{by_id}{$id};
         $response{by_id}{$id}={"id"=>$id};
         foreach my $key(qw(qyname qytype qycrit qyopts qycalst qyclst qydesc qyslst qyform qyflbl qyftyp)){
             $response{by_id}{$id}{$key}=between($query, "<$key>", "</$key>");
         }
         $response{by_name}{$response{by_id}{$id}{qyname}}=$response{by_id}{$id};
-    }    
+    }
     return \%response;
 }
 
@@ -1249,24 +1281,24 @@ sub between{
 
     my $start_index =index($str, $start, $pos);
        $start_index+=length($start) unless $inclusive;
-    
+
     my $end_index =index($str, $end, $start_index)-$start_index;
        $end_index+=length($end) if $inclusive;
-    
+
     return "" if $start_index < 0 or $end_index < 0;
-    
+
     return substr($str, $start_index, $end_index);
 }
 
 sub xml_escape($) {
     my ($self, $rest) = @_;
     unless(defined($rest)){return "";}
-    $rest   =~ s/&/&amp;/g; 
+    $rest   =~ s/&/&amp;/g;
     $rest   =~ s/</&lt;/g;
     $rest   =~ s/>/&gt;/g;
     $rest   =~ s/([^;\/?:@&=+\$,A-Za-z0-9\-_.!~*'()# ])/$xml_escapes{$1}/g;
     return $rest;
-} 
+}
 
 sub xml_unescape($) {
     my ($self, $rest) = @_;
@@ -1279,14 +1311,14 @@ sub xml_unescape($) {
     $rest   =~ s/&quot;/\"/g;
     $rest   =~ s/&#([0-9]{2,3});/chr($1)/eg;
     return $rest;
-} 
+}
 
 sub encode32($){
     my ($self, $number) = @_;
     my $result = "";
     while ($number > 0){
           my $remainder = $number % 32;
-          $number = ($number - $remainder)/32; 
+          $number = ($number - $remainder)/32;
           $result = substr('abcdefghijkmnpqrstuvwxyz23456789', $remainder, 1) . $result;
     }
     return $result;
@@ -1316,7 +1348,7 @@ sub createFieldXML{
         if($$value[0] =~ /^file/i){
             #This is a file attachment!
             my $filename = "";
-            my $buffer = "";    
+            my $buffer = "";
             my $filecontents = "";
             if($$value[1] =~ /[\\\/]([^\/\\]+)$/){
                 $filename = $1;
@@ -1402,11 +1434,12 @@ perl -MPod::Html -e "pod2html('--infile=QuickBase.pm','--outfile=QuickBase.html'
 
 =pod
 
-=for html 
+=for html
 <style type="text/css">
     a:link, a:visited, h1, h2{background:transparent; color:#1A75CF;}
     body{background: white;color: black;font-family: arial,sans-serif;margin: 0;padding: 1ex;}
-    table{border-collapse: collapse;border-spacing: 0;border-width: 0;color: inherit;}
+    pre{background: #eee;border: 1px solid #888;color: black;padding: 1em;white-space: pre;}
+    /*table{border-collapse: collapse;border-spacing: 0;border-width: 0;color: inherit;}
     img{border:0;}
     form{margin:0;}
     input{ margin:2px;}
@@ -1414,8 +1447,7 @@ perl -MPod::Html -e "pod2html('--infile=QuickBase.pm','--outfile=QuickBase.html'
     div{border-width: 0;}
     dt{margin-top: 1em;}
     th{background: #bbb;color: inherit;padding: 0.4ex 1ex;text-align: left;}
-    th a:link, th a:visited{color: black;}
-    pre{background: #eee;border: 1px solid #888;color: black;padding: 1em;white-space: pre;}
+    th a:link, th a:visited{color: black;}*/
 </style>
 <h1 align="center">HTTP::QuickBase</h1>
 <h2 align="center">Create a web shareable database in under a minute.</h2>
@@ -1429,89 +1461,89 @@ HTTP::QuickBase - Create a web shareable database in under a minute
 
  use HTTP::QuickBase;
  $qdb = HTTP::QuickBase->new();
- 
+
  # If you don't want to use HTTPS or your Perl installation doesn't support
  # HTTPS then make sure you have the "Allow non-SSL access (normally OFF)"
  # checkbox checked on your QuickBase database info page. You can get to this
  # page by going to the database "MAIN" page and then clicking on
  # "Administration" under "SHORTCUTS". Then click on "Basic Properties". To use
  # this module in non-SSL mode invoke the QuickBase object like this:
- 
+
  # $qdb = HTTP::QuickBase->new('http://www.quickbase.com/db');
- 
+
  $username = "fred";
  $password = "flinstone";
- 
+
  $qdb->authenticate($username, $password);
- 
+
  $database_name = "GuestBook Template";
  $database_id = "9mztyxu8";
- 
+
  $clone_name = "My Guest Book";
- 
+
  $database_clone_id = $qdb->clone_database($database_id, $clone_name, "Description of my new database.");
- 
- 
+
+
  # Let's put something into the new guest book
  $record_id = $qdb->add_record(
-    $database_clone_id, 
+    $database_clone_id,
     {
       "Name"             => "Fred Flinstone",
-      "Daytime Phone"    => "978-533-2189", 
+      "Daytime Phone"    => "978-533-2189",
       "Evening Phone"    => "781-839-1555",
-      "Email Address"    => "fred\@bedrock.com", 
+      "Email Address"    => "fred\@bedrock.com",
       "Street Address 1" => "Rubble Court",
       "Street Address 2" => "Pre Historic Route 1",
       "City"             => "Bedrock",
       "State"            => "Stonia",
       "Zip Code"         => "99999-1234",
       "Comments"         => "Hanna Barbara, the king of Saturday morning cartoons.",
-      
-      # If you want to attach a file you need to create an array with the first 
-      # member of the array set to the literal string "file" and the second 
+
+      # If you want to attach a file you need to create an array with the first
+      # member of the array set to the literal string "file" and the second
       # member of the array set to the full path of the file.
       "Attached File"    => ["file", "c:\\my documents\\bedrock.txt"]
     }
  );
- 
+
  # Let's get that information back out again
  %new_record=$qdb->get_record($database_clone_id, $record_id);
  # Now let's edit that record!
  $new_record{"Daytime Phone"} = "978-275-2189";
  $qdb->edit_record($database_clone_id, $record_id, \%new_record);
- 
+
  # Let's print out all records in the database.
- 
+
  @records = $qdb->do_query($database_clone_id, "{0.CT.''}");
  foreach $record (@records){
     foreach $field (keys %$record){
         print "$field -> $record->{$field}\n";
     }
  }
- 
+
  # Let's save the entire database to a local comma separated values (CSV) file.
- 
+
  open CSV, ">my_qdb_snapshot.csv";
  print CSV $qdb->get_complete_csv($database_clone_id);
- close CSV; 
- 
+ close CSV;
+
  # Where field number 10 contains Wilma (the query)
  # let's print out fields 10, 11, 12 and 15 (the clist)
  # sorted by field 14 (the slist)
  # in descending order (the options)
- 
+
  @records = $qdb->do_query($database_clone_id, "{10.CT.'Wilma'}", "10.11.12.15", "14", "sortorder-D");
  foreach $record (@records){
     foreach $field (keys %$record){
         print "$field -> $record->{$field}\n";
     }
  }
- 
- # You can find out what you need in terms of the query, clist, slist and 
- # options by going to the View design page of your QuickBase database and 
- # filling in the form. Hit the "Display" button and look at the URL in the 
- # browser "Address" window. The View design page is accessible from any 
- # database home page by clicking on VIEWS at the top left and then clicking 
+
+ # You can find out what you need in terms of the query, clist, slist and
+ # options by going to the View design page of your QuickBase database and
+ # filling in the form. Hit the "Display" button and look at the URL in the
+ # browser "Address" window. The View design page is accessible from any
+ # database home page by clicking on VIEWS at the top left and then clicking
  # on "New View..." in the lower left.
 
 =head1 REQUIRES
@@ -1528,11 +1560,11 @@ Nothing
 
 =head1 DESCRIPTION
 
-HTTP::QuickBase allows you to manipulate QuickBase databases.  
+HTTP::QuickBase allows you to manipulate QuickBase databases.
 Methods are provided for cloning databases, adding records, editing records, deleting records and retrieving records.
 All you need is a valid QuickBase account, although with anonymous access you can read from publically accessible QuickBase
 databases. To learn more about QuickBase please visit http://www.quickbase.com/
-This module supports a single object that retains login state. You call the authenticate method only once. 
+This module supports a single object that retains login state. You call the authenticate method only once.
 
 =head1 METHODS
 
@@ -1583,9 +1615,9 @@ B<Example(s)>
      &lt;/xsl:template&gt;
  &lt;/xsl:stylesheet&gt;
  XSLHTML
- 
+
  my $page_id=$qdb-&gt;add_db_page("bdcagynhs", $pagename, $pagetype, $pagebody);
- 
+
  print $page_id; # 6</PRE>
 
 =end html
@@ -1612,7 +1644,7 @@ The name of the new field.
 
 =item * Field Type
 
-The type of field you wish to add.  The eligible type names differ slightly 
+The type of field you wish to add.  The eligible type names differ slightly
 from their QuickBase UI counterparts:
 
  QUICKBASE TYPE (UI)        API TYPE
@@ -1635,8 +1667,8 @@ from their QuickBase UI counterparts:
 
 =item * [optional] Mode
 
-If you want the field to be a formula specify "virtual".  This can be set for 
-any field type (type can be set to any value).  If you want the field to be 
+If you want the field to be a formula specify "virtual".  This can be set for
+any field type (type can be set to any value).  If you want the field to be
 lookup specify "lookup" and set the Field Type to a text or numeric type.
 
 =back
@@ -1644,7 +1676,7 @@ lookup specify "lookup" and set the Field Type to a text or numeric type.
 B<Example(s)>
 
  my $fid=$qdb->add_field("bddrqepes", "Phone Number", "phone");
- 
+
  print $fid; # Prints 10
 
 B<See Also:> L</"delete_field">
@@ -1685,10 +1717,10 @@ A hash reference containing the record data:
  {
      # First field, referenced by field name
      "fieldname" => "fieldvalue",
-     
+
      # Second field, referenced by field ID
      "22" => "otherfieldvalue",
-     
+
      # Third field, file attachment type, referenced by field ID
      "30" => ["file", "/path/to/myfile.jpg"]
  }
@@ -1702,7 +1734,7 @@ The record ID of the record added.
 B<Example(s)>
 
  my $rid = $qdb->add_record("bdcagynhs", {"FirstName"=>"John", "LastName"=>"Doe"});
- 
+
  print $rid; # Prints 7
 
 =for comment ######################### add_replace_db_page #########################
@@ -1721,7 +1753,7 @@ The QuickBase Database ID of the application on which the page resides or will r
 
 =item * Page ID OR Page Name
 
-If you are adding a new page then you should pass the file name of the page 
+If you are adding a new page then you should pass the file name of the page
 here.  If you are editing an existing page then you should pass the page ID
 here.
 
@@ -1758,14 +1790,14 @@ B<Example(s)>
      &lt;/xsl:template&gt;
  &lt;/xsl:stylesheet&gt;
  XSLHTML
- 
+
  my $page_id=$qdb-&gt;add_replace_db_page("bdb5rjd6h", $pagename, $pagetype, $pagebody);
- 
+
  print $page_id; # Prints 6
- 
+
  # Replaces new page with empty file
  my $edited_page_id=$qdb-&gt;add_replace_db_page("bdcagynhs", $page_id, $pagetype, "");
- 
+
  print $edited_page_id; # Prints 6</PRE>
 
 =end html
@@ -1776,22 +1808,22 @@ B<See Also:> L</"add_db_page">, L</"replace_db_page">
 
 =head2 add_user_to_role
 
-Access to your application is governed by the roles in effect for your 
-application.  Users can access your application only if you assign them to one 
-(or more) of these roles.  You assign a user to a role using this call.  A 
-common use of this call is to set up a second call, L</"send_invitation">, 
+Access to your application is governed by the roles in effect for your
+application.  Users can access your application only if you assign them to one
+(or more) of these roles.  You assign a user to a role using this call.  A
+common use of this call is to set up a second call, L</"send_invitation">,
 where you let the user know that the user can access the application.
 
-If you want a user to have several roles, you can invoke this on the same user 
+If you want a user to have several roles, you can invoke this on the same user
 several times, each time specifying a different role.
 
-Although an application can use the standard default roles (viewer, participant, 
-administrator), each application can have its own set of roles, with the access 
-and permissions per role set up as needed by that particular application.  You 
-can find out what the roles are for the current application by calling 
+Although an application can use the standard default roles (viewer, participant,
+administrator), each application can have its own set of roles, with the access
+and permissions per role set up as needed by that particular application.  You
+can find out what the roles are for the current application by calling
 L</"get_role_info">.
 
-In order to make this call, you have to have administrator-level access in the 
+In order to make this call, you have to have administrator-level access in the
 application.
 
 See also L</"provision_user"> for an alternate way to assign roles to users.
@@ -1826,17 +1858,21 @@ B<See Also:> L</"provision_user">, L</"send_invitation">, L</"get_role_info">
 
 =for comment ######################### apptoken #########################
 
-=head2 apptoken
+=head2 apptoken/apptokens
 
-Provides access to the apptoken property
+Provides access to the apptoken property and L</"apptoken_map"> method
 
 B<Parameters>
 
 =over
 
-=item * [optional] Apptoken 
+=item * [optional] Apptoken
 
 The apptoken for subsequent calls
+
+=item * [optional] DBIDE<#40>s)
+
+The DBIDE<#40>s) for which this apptoken should be used
 
 =back
 
@@ -1844,23 +1880,59 @@ B<Example(s)>
 
  # Prints the current apptoken
  print $qdb->apptoken();
- 
+
  # Assigns "b8qtx9rsf9gd..." to the apptoken property
  $qdb->apptoken("b8qtx9rsf9gd...");
+
+ # Assigns "b8qtx9rsf9gd..." to the "1brmpie0a" dbid
+ $qdb->apptoken("b8qtx9rsf9gd...","1brmpie0a");
+
+ # Assigns Assigns "b8qtx9rsf9gd..." to multiple dbids
+ $qdb->apptokens("b8qtx9rsf9gd...","1brmpie0a","1brmpie0b","1brmpie0c","1brmpie0d");
+
+=for comment ######################### apptoken_map #########################
+
+=head2 apptoken_map
+
+Used to map apptokens to dbids.  Subsequent calls which target the provided dbids
+will use the apptoken provided.
+
+B<Parameters>
+
+=over
+
+=item * [HASHREF] Map
+
+The apptoken mapping to add
+
+=back
+
+B<Example(s)>
+
+ # Map out the apptokens to be used
+ $qdb->apptoken_map({
+   "1brmpie0a"=>"b8qtx9rsf9gd...",
+
+   "bfd3yzkw2"=>"cttwnzvd9vm9..."
+ });
+
+ # Setting and changing the apptoken between calls is unnecessary
+ $qdb->do_query("1brmpie0a","{0.CT.''}");
+ $qdb->do_query("bfd3yzkw2","{0.CT.''}");
 
 =for comment ######################### authenticate #########################
 
 =head2 authenticate
 
-Initiates an authentication process, sending the     
-username and password and retrieving a unique        
-ticket identifier.  Ticket retrieved will be stored  
+Initiates an authentication process, sending the
+username and password and retrieving a unique
+ticket identifier.  Ticket retrieved will be stored
 in QuickBase instance and automatically inserted into
-subsequent API calls.                                
+subsequent API calls.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * Username
 
@@ -1874,7 +1946,7 @@ The password of the QuickBase user
 
 B<Example(s)>
 
- # Authenticates the current $qdb object with QuickBase 
+ # Authenticates the current $qdb object with QuickBase
  # using the username/password my-username/my-password
  $qdb->authenticate("my-username","my-password");
 
@@ -1882,21 +1954,21 @@ B<Example(s)>
 
 =head2 change_record_owner
 
-The record owner, by default, is the user who created it.  QuickBase can use 
-record ownership to restrict access.  Normally, this is done through roles, 
-where a role can be set up to restrict view and/or modify access to the record 
+The record owner, by default, is the user who created it.  QuickBase can use
+record ownership to restrict access.  Normally, this is done through roles,
+where a role can be set up to restrict view and/or modify access to the record
 owner.
 
-In order to call this method, you must have administrator rights to the 
+In order to call this method, you must have administrator rights to the
 application.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
-Table-level dbid of the table containing the record you wish to transfer 
+Table-level dbid of the table containing the record you wish to transfer
 ownership of.
 
 =item * Record ID
@@ -1925,7 +1997,7 @@ This call allows you to assign a user to a different role.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -1941,7 +2013,7 @@ The current role ID of the user.
 
 =item * [optional] New Role ID
 
-The role ID of the role you wish to change the user to.  If no ID is specified 
+The role ID of the role you wish to change the user to.  If no ID is specified
 for this parameter then the new role will be "None".
 
 =back
@@ -1958,13 +2030,13 @@ B<Example(s)>
 
 =head2 clone_database
 
-Clone a QuickBase Application, including the schema, views, and users.  
-Optionally, the data can be cloned as well, and if so the file attachments can 
+Clone a QuickBase Application, including the schema, views, and users.
+Optionally, the data can be cloned as well, and if so the file attachments can
 be optionally included or excluded.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -1994,23 +2066,23 @@ The DB ID of the new database.
 
 B<Example(s)>
 
- # Clone bdb5rjd6h, calling the clone "New Database" with the description 
+ # Clone bdb5rjd6h, calling the clone "New Database" with the description
  # "My cloned database".  Keep the data and the file attachments.
  my $newdbid = $qdb->clone_database("bdb5rjd6h","New Database","My cloned database",1,0);
- 
+
  print $newdbid; # Prints bddnc6pn7
 
 =for comment ######################### create_database #########################
 
 =head2 create_database
 
-Creates a new QuickBase application with the main application table 
-populated only with the built-in fields and optionally generates and 
+Creates a new QuickBase application with the main application table
+populated only with the built-in fields and optionally generates and
 returns an apptoken for API use.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * Application Name
 
@@ -2028,7 +2100,7 @@ Set to 1 to create an apptoken for the new application.
 
 B<Returns>
 
-Returns a hash object containing the new application-level dbid of the new 
+Returns a hash object containing the new application-level dbid of the new
 application and the apptoken if one was created:
 
  {
@@ -2039,13 +2111,13 @@ application and the apptoken if one was created:
 
 B<Example(s)>
 
- # Create a new application named Fuel Charter with the description Vehicle 
+ # Create a new application named Fuel Charter with the description Vehicle
  # and Fuel Cost Tracker.
  # Also create an apptoken for the new application.
  my %newapp = $qdb->create_database("Fuel Charter", "Vehicle and Fuel Cost Tracker", 1);
- 
+
  print $newapp{'dbid'}; # Prints bddnn3uz9
- 
+
  print $newapp{'apptoken'}; # Prints cmzaaz3dgdmmwwksdb7zcd7a9wg
 
 =for comment ######################### create_table #########################
@@ -2085,13 +2157,13 @@ B<Example(s)>
 
 =head2 delete_database
 
-If you have application administration rights you can use this call to delete 
-either a child table or the entire application, depending on the dbid you 
+If you have application administration rights you can use this call to delete
+either a child table or the entire application, depending on the dbid you
 supply.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2111,13 +2183,13 @@ B<Example(s)>
 
 =head2 delete_field
 
-If you have application administration rights you can use  this call to delete 
-a table field by specifying the field id.  You have to use a table-level dbid, 
+If you have application administration rights you can use  this call to delete
+a table field by specifying the field id.  You have to use a table-level dbid,
 otherwise you will get an Error 31: No such field.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2141,14 +2213,14 @@ B<Example(s)>
 
 =head2 delete_record
 
-If you have application administration rights you can use this call to delete 
-a table record.  You have to use a table-level dbid, otherwise you will get an 
-error.  If you want to delete several records at one time, you might want to 
+If you have application administration rights you can use this call to delete
+a table record.  You have to use a table-level dbid, otherwise you will get an
+error.  If you want to delete several records at one time, you might want to
 use L</"purge_records">.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2172,9 +2244,9 @@ B<Example(s)>
 
 =head2 do_query
 
-You invoke this on a table dbid to get records from the table.  You can use 
-this to get all the records and fields, but typically you would want to get 
-only some of the records and only those fields you want, ordered and sorted 
+You invoke this on a table dbid to get records from the table.  You can use
+this to get all the records and fields, but typically you would want to get
+only some of the records and only those fields you want, ordered and sorted
 the way you want them to be.
 
 =for html
@@ -2184,7 +2256,7 @@ QuickBase HTTP API Programmer's Guide</a> under "Building and Using Queries".</p
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2192,15 +2264,15 @@ The table-level dbid of the QuickBase database you wish to query.
 
 =item * [optional] Query/Query ID/Query Name
 
-This parameter can be an ad hoc custom query or the ID or name of a query 
+This parameter can be an ad hoc custom query or the ID or name of a query
 currently saved in the QuickBase application.
 
 If the parameter is blank all records will be returned.
 
 =item * [optional] Column List
 
-A period-delimited list of field IDs to be returned.  The order you list these 
-in is the order in which they'll be returned.  Alternatively, you can specify 
+A period-delimited list of field IDs to be returned.  The order you list these
+in is the order in which they'll be returned.  Alternatively, you can specify
 the value "C<a>" to get all the columns.
 
 If the parameter is blank the table's default columns will be returned.
@@ -2221,7 +2293,7 @@ A period-delimited list of options.
  sortorder-A    sort ascending
  sortorder-D    sort descending
 
-C<sortorder->I<x> options work with the Sort List.  If one sortorder is 
+C<sortorder->I<x> options work with the Sort List.  If one sortorder is
 specified it will use the first column in the Sort List, the second will
 use the second column, etc.
 
@@ -2229,7 +2301,7 @@ use the second column, etc.
 
 Specify "C<structured>" to get additional table, field, and application information.
 
-Specify a value other than C<structured> to retrieve minimal information.  
+Specify a value other than C<structured> to retrieve minimal information.
 "C<unstructured>" is recommended in these cases.
 
 Default if left blank is C<structured>.
@@ -2261,7 +2333,7 @@ Otherwise, the subroutine will return a hash with the following structure:
      def_sort_fid=>6
      def_sort_order=>1
      lastluserid=>0,
-     
+
      # fields only available via "structured" format
      fields=>{
          by_id=>{
@@ -2341,7 +2413,7 @@ Otherwise, the subroutine will return a hash with the following structure:
              }
          }
      },
-     
+
      # queries only available via "structured" format
      queries=>{
          by_id=>{
@@ -2381,30 +2453,30 @@ Otherwise, the subroutine will return a hash with the following structure:
              }
          }
      },
-     
+
      # users only available via "structured" format
      users=>{
          "112149.bhsv"=>"AppBoss"
      },
-     
+
      # if the subroutine is called in array context then only this array will return
      records=>[
-         
+
          # Structured format
          {
              "5"=>"112149.bhsv",
              "Last Modified By"=>"112149.bhsv",
-             
+
              "6"=>"(123) 333-4321 x34566",
              "Business Phone Number"=>"(123) 333-4321 x34566"
          },
-         
+
          # Unstructured format
          {
              last_modified_by=>"AppBoss",
              business_phone_number=>"(123) 333-4321 x34566"
          },
-         
+
          {
              # etc...
          }
@@ -2422,18 +2494,18 @@ B<Example(s)>
      "sortorder-A",       # Sort ascending
      "structured"         # Request structured results
  );
- 
+
  # Loop through the records of the results
  foreach my $record(@{$results->{'records'}}){
-     
+
      # Retrieve the Contact username of the current record by looking up the
      # user id in the results->users hash
      my $user = $results->{'users'}{$record->{'Contact'}};
-     
+
      # Prints "Ragnar: (123) 333-4321 x34566"
      print "$user: " . $record->{'Business Phone Number'} . "\n";
  }
- 
+
  # Alternative method using array context
  # Using query ID 6 and defaults for other params
  foreach my $record($qdb->do_query("bdb5rjd6h","6")){
@@ -2444,13 +2516,13 @@ B<Example(s)>
 
 =head2 edit_record
 
-You can use this to change any of the editable field values in the specified 
-record.  Only those fields specified are changed, unspecified fields are left 
+You can use this to change any of the editable field values in the specified
+record.  Only those fields specified are changed, unspecified fields are left
 unchanged.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2462,17 +2534,17 @@ The record ID of the record you want to edit.
 
 =item * Fields/Values
 
-A hash or array reference of field name/value pairs for editing.  e.g. 
+A hash or array reference of field name/value pairs for editing.  e.g.
 C<{"email"=E<gt>"cucamonga@chuck.com"}> or C<[{"name"=E<gt>"email", "value"=E<gt>"cucamonga@chuck.com"}]>
 
-The hash reference will assume that hash keys are field names if they do not 
+The hash reference will assume that hash keys are field names if they do not
 match the regex C<m/^\d+$/>.  Otherwise they will be assumed to be field IDs.
 
 =back
 
 B<Returns>
 
-A hash reference containing the number of fields changed, the update ID, and 
+A hash reference containing the number of fields changed, the update ID, and
 the full content of the server response in the following format:
 
  {
@@ -2485,7 +2557,7 @@ B<Example(s)>
 
  # Update record 25 in table bdb5rjd6h and change the email field to "cucamonga@chuck.com"
  my %results=$qdb->edit_record("bdb5rjd6h","25",{"email"=>"cucamonga@chuck.com"});
- 
+
  # Prints "1205700275470 1"
  print $results->{'update_id'} . " " . $results->{'num_fields_changed'} . "\n";
 
@@ -2495,17 +2567,17 @@ B<See Also:> L</"edit_record_with_update_id">
 
 =head2 edit_record_with_update_id
 
-Like L</"edit_record">, you can use this to change any of the editable field 
+Like L</"edit_record">, you can use this to change any of the editable field
 values in the specified record.  Unlike L</"edit_record">, the update will only
-be successful if the update_id provided is valid.  This is to prevent potential 
+be successful if the update_id provided is valid.  This is to prevent potential
 collisions with multiple people editing the same record.
 
-As before, only those fields specified are changed,  unspecified fields are 
+As before, only those fields specified are changed,  unspecified fields are
 left unchanged.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2521,10 +2593,10 @@ The current Update ID of the record you want to edit.
 
 =item * Fields/Values
 
-A hash or array reference of field name/value pairs for editing.  e.g. 
+A hash or array reference of field name/value pairs for editing.  e.g.
 C<{"email"=E<gt>"cucamonga@chuck.com"}> or C<[{"name"=E<gt>"email", "value"=E<gt>"cucamonga@chuck.com"}]>
 
-The hash reference will assume that hash keys are field names if they do not 
+The hash reference will assume that hash keys are field names if they do not
 match the regex C<m/^\d+$/>.  Otherwise they will be assumed to be field IDs.
 
 =back
@@ -2533,7 +2605,7 @@ B<Returns>
 
 If unsuccessful, a False value.
 
-If successful, a hash reference containing the number of fields changed, the update ID, and 
+If successful, a hash reference containing the number of fields changed, the update ID, and
 the full content of the server response in the following format:
 
  {
@@ -2546,7 +2618,7 @@ B<Example(s)>
 
  # Update record 25 in table bdb5rjd6h and change the email field to "cucamonga@chuck.com"
  my %results=$qdb->edit_record("bdb5rjd6h","25",1205700275470,{"email"=>"cucamonga@chuck.com"});
- 
+
  # Prints "992017018414 1"
  print $results->{'update_id'} . " " . $results->{'num_fields_changed'} . "\n";
 
@@ -2560,7 +2632,7 @@ A method for accessing the current error code.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * [optional] Error Code
 
@@ -2575,9 +2647,9 @@ The current error code.
 B<Example(s)>
 
  print $qdb->error; # Prints "0"
- 
+
  $qdb->create_database("Fuel Charter", "Vehicle and Fuel Cost Tracker", 1);
- 
+
  print $qdb->error; # Prints "74" (You are not allowed to create applications)
 
 =for comment ######################### errortext #########################
@@ -2588,7 +2660,7 @@ A method for accessing the current error text.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * [optional] Error Text
 
@@ -2603,26 +2675,26 @@ The current error text.
 B<Example(s)>
 
  print $qdb->errortext; # Prints ""
- 
+
  $qdb->create_database("Fuel Charter", "Vehicle and Fuel Cost Tracker", 1);
- 
+
  print $qdb->errortext; # Prints "You are not allowed to create applications"
 
 =for comment ######################### field_add_choices #########################
 
 =head2 field_add_choices
 
-If you have administrative rights you can add new choices to any field through 
-this method.  If you don't have administrative rights you can only invoke this 
-method if the multiple-choice field properties are set to allow new choices to 
+If you have administrative rights you can add new choices to any field through
+this method.  If you don't have administrative rights you can only invoke this
+method if the multiple-choice field properties are set to allow new choices to
 be added.
 
-If the choice you add already exists in the multiple choice list, the choice 
+If the choice you add already exists in the multiple choice list, the choice
 will not be added (no duplicates).
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2645,7 +2717,7 @@ The number of choices that were added to the field.
 B<Example(s)>
 
  my $num_added = $qdb->field_add_choices("bdb5rjd6h", 25, ["Choice 1","Choice 2"]);
- 
+
  print $num_added; # Prints "2"
 
 B<See Also:> L</"field_remove_choices">
@@ -2654,13 +2726,13 @@ B<See Also:> L</"field_remove_choices">
 
 =head2 field_remove_choices
 
-If you have administrative rights you can remove choices from any field through 
-this method.  If you don't have administrative rights you can only invoke this 
+If you have administrative rights you can remove choices from any field through
+this method.  If you don't have administrative rights you can only invoke this
 method if the choice was created by you.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2683,7 +2755,7 @@ The number of choices that were removed from the field.
 B<Example(s)>
 
  my $num_removed = $qdb->field_remove_choices("bdb5rjd6h", 25, ["Choice 1","Choice 2"]);
- 
+
  print $num_removed; # Prints "2"
 
 B<See Also:> L</"field_add_choices">
@@ -2692,16 +2764,16 @@ B<See Also:> L</"field_add_choices">
 
 =head2 find_db_by_name
 
-This method can be used to get the application-level dbid of an application 
-whose name you know.  Only those applications that have granted you access 
+This method can be used to get the application-level dbid of an application
+whose name you know.  Only those applications that have granted you access
 rights will be searched.
 
-Because there can exist multiple applications with the same name, you should 
+Because there can exist multiple applications with the same name, you should
 be aware that more than one application dbid can be returned.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * Database Name
 
@@ -2716,24 +2788,24 @@ An array of dbids for databases matching the name you searched for.
 B<Example(s)>
 
  my @dbids = $qdb->find_db_by_name("My Application");
- 
+
  print $dbids[0]; # Prints "bdcagynhs"
 
 =for comment ######################### gen_add_record_form #########################
 
 =head2 gen_add_record_form
 
-This method returns the standard QuickBase new record add page (in HTML) for 
-the table whose dbid you specify.  It contains edit fields for the user to fill 
+This method returns the standard QuickBase new record add page (in HTML) for
+the table whose dbid you specify.  It contains edit fields for the user to fill
 and a save button to add the record to the database.
 
-If you want to pre-fill any fields you can do so by supplying one or more 
-field/value pairs in the request.  Any fields not pre-filled or filled in by 
+If you want to pre-fill any fields you can do so by supplying one or more
+field/value pairs in the request.  Any fields not pre-filled or filled in by
 the user will get the default values set in the table field properties.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2741,7 +2813,7 @@ The table-level dbid of the table you want to generate the form for.
 
 =item * [optional] Field/Value List
 
-A hash reference of field/value pairs for default values, e.g. 
+A hash reference of field/value pairs for default values, e.g.
 C<{"email"=E<gt>"cucamonga@chuck.com", "phone"=E<gt>"(123) 456-7890"}>
 
 =back
@@ -2753,23 +2825,23 @@ Returns an HTML page containing the record add page with any pre-filled values.
 B<Example(s)>
 
  my $html = $qdb->gen_add_record_form("bddrqepes", {"email"=>"cucamonga@chuck.com", "phone"=>"(123) 456-7890"});
- 
+
  print $html; # Prints the html page
 
 =for comment ######################### gen_results_table #########################
 
 =head2 gen_results_table
 
-This method is typically used in its URL form in an HTML page to embed the 
-results as HTML, but it can also return results as a JavaScript array, in CSV 
+This method is typically used in its URL form in an HTML page to embed the
+results as HTML, but it can also return results as a JavaScript array, in CSV
 format, or as tab separated values.
 
-The SDK does not yet parse the results of any of these formats, and simply 
+The SDK does not yet parse the results of any of these formats, and simply
 returns the raw response.
 
 B<Parameters (A)>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2777,15 +2849,15 @@ The QuickBase table-level dbid against which the query will be executed.
 
 =item * [optional] Query
 
-This parameter can be an ad hoc custom query or the ID or name of a query 
+This parameter can be an ad hoc custom query or the ID or name of a query
 currently saved in the QuickBase application.
 
 If the parameter is blank all records will be returned.
 
 =item * [optional] Column List
 
-A period-delimited list of field IDs to be returned.  The order you list these 
-in is the order in which they'll be returned.  Alternatively, you can specify 
+A period-delimited list of field IDs to be returned.  The order you list these
+in is the order in which they'll be returned.  Alternatively, you can specify
 the value "C<a>" to get all the columns.
 
 If the parameter is blank the table's default columns will be returned.
@@ -2825,7 +2897,7 @@ A period-delimited list of options.
  csv            comma-separated value output format
  tsv            tab-separated value output format
 
-C<sortorder->I<x> options work with the Sort List.  If one sortorder is 
+C<sortorder->I<x> options work with the Sort List.  If one sortorder is
 specified it will use the first column in the Sort List, the second will
 use the second column, etc.
 
@@ -2833,8 +2905,8 @@ use the second column, etc.
 
 B<Parameters (B)>
 
-Because of the number of parameters this method accepts, it will also accept 
-an alternative style wherein the 2nd through 7th parameters can be combined 
+Because of the number of parameters this method accepts, it will also accept
+an alternative style wherein the 2nd through 7th parameters can be combined
 into a single hash reference.  This aids readability and cuts down on
 unnecessary empty parameters.
 
@@ -2846,7 +2918,7 @@ The QuickBase table-level dbid against which the query will be executed.
 
 =item * Options Hash
 
-A hash object reference containing the options you wish to set in the following 
+A hash object reference containing the options you wish to set in the following
 format:
 
  {
@@ -2867,19 +2939,19 @@ Currently returns the raw response contents from the API call.
 B<Example(s)>
 
  my $results = $qdb->gen_results_table("bddrqepes",{query=>"{'0'.CT.''}",options=>'csv'});
- 
+
  print $results; # Prints "one,two,three,etc."
 
 =for comment ######################### get_complete_csv #########################
 
 =head2 get_complete_csv
 
-Performs a L</"gen_results_table"> call, specifying all columns and all records 
+Performs a L</"gen_results_table"> call, specifying all columns and all records
 and the CSV format.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2899,14 +2971,14 @@ B<Example(s)>
 
 =head2 get_db_info
 
-You can invoke this on the application-level dbid or the table dbid to get 
-metadata information, such as the last time the table was modified.  For 
-example, you might use this function to find out if the table has changed since 
+You can invoke this on the application-level dbid or the table dbid to get
+metadata information, such as the last time the table was modified.  For
+example, you might use this function to find out if the table has changed since
 you last used it, or to find out if a new record has been added to the table.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2932,21 +3004,21 @@ Returns a hash of the following format:
 B<Example(s)>
 
  my %dbinfo = $qdb->get_db_info("bddrqepes");
- 
+
  print $dbinfo{'dbname'}; # Prints "Test DB"
 
 =for comment ######################### get_db_page #########################
 
 =head2 get_db_page
 
-QuickBase allows you to store various types of pages, ranging from user-guide 
-pages for your application to Exact Forms which are used to automate insertion 
-of data into Word documents using a special Word template from QuickBase.  This 
+QuickBase allows you to store various types of pages, ranging from user-guide
+pages for your application to Exact Forms which are used to automate insertion
+of data into Word documents using a special Word template from QuickBase.  This
 call lets you retrieve one of those pages in HTML.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2965,20 +3037,20 @@ The requested page is returned in HTML.
 B<Example(s)>
 
  my $page = $qdb->get_db_page("bdb5rjd6h", 6);
- 
+
  print $page; # Prints "<html><head>..."
 
 =for comment ######################### get_db_var #########################
 
 =head2 get_db_var
 
-DBVars are variables you can create and set values in at the application level, 
-using the application-level dbid.  This lets you get the values from these 
+DBVars are variables you can create and set values in at the application level,
+using the application-level dbid.  This lets you get the values from these
 DBVars.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -2997,7 +3069,7 @@ The value of the DBVar requested.
 B<Example(s)>
 
  my $color = $qdb->get_db_var("bddrqepes", "MyColor");
- 
+
  print $color; # Prints "blue"
 
 =for comment ######################### get_file #########################
@@ -3008,7 +3080,7 @@ Retrieves a file from QuickBase for given a table, record, and field.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3024,20 +3096,20 @@ The field ID of the file.
 
 =item * [optional] Version
 
-The version number of the file.  Omitting this parameter, or using 0, will 
+The version number of the file.  Omitting this parameter, or using 0, will
 return the most recent version.
 
 =back
 
 B<Returns>
 
-An array containing the file as the first element and the HTTP::Response 
+An array containing the file as the first element and the HTTP::Response
 headers as the second element.
 
 B<Example(s)>
 
  my ($file) = $qdb->get_file("bdcagynhs", 78, 13);
- 
+
  print "$file"; # Prints retrieved file's contents
 
 =for comment ######################### get_num_records #########################
@@ -3048,7 +3120,7 @@ Returns the number of records in the table.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3063,17 +3135,17 @@ The number of records in the table.
 B<Example(s)>
 
  my $num_records = $qdb->get_num_records("bdb5rjd6h");
- 
+
  print $num_records; # Prints 17
 
 =for comment ######################### get_one_time_ticket #########################
 
 =head2 get_one_time_ticket
 
-Returns a single-use ticket that expires after five minutes.  After use, the 
+Returns a single-use ticket that expires after five minutes.  After use, the
 ticket is no longer valid.
 
-Intended for use with API_UploadFile, which is necessary only in environments 
+Intended for use with API_UploadFile, which is necessary only in environments
 that do not have access to the local filesystem.
 
 B<Parameters>
@@ -3096,7 +3168,7 @@ You invoke this on a table-level dbid to get all of the fields in a record.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3139,21 +3211,21 @@ Returns a hash of the following format:
 B<Example(s)>
 
  my %record = $qdb->get_record("bdb5rjd6h", 20);
- 
+
  print $record{'file attachment'}{'value'}; # Prints "BatchID.html"
 
 =for comment ######################### get_record_as_html #########################
 
 =head2 get_record_as_html
 
-You invoke this call on a table-level dbid to return a record as an HTML 
+You invoke this call on a table-level dbid to return a record as an HTML
 fragment that can be embedded in another HTML page.
 
 Most frequently this method will be called via the GET method in a URL.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3165,8 +3237,8 @@ The Record ID (or rid) of the record you wish to retrieve
 
 =item * [optional] Format
 
-Set to 1 to return the information in Javascript format.  The javascript will 
-contain a function called qdbWrite which, when called, will output the HTML 
+Set to 1 to return the information in Javascript format.  The javascript will
+contain a function called qdbWrite which, when called, will output the HTML
 via document.write commands.
 
 Omit this parameter for plain HTML format.
@@ -3180,21 +3252,21 @@ A string containing either a Javascript or an HTML representation of the record.
 B<Example(s)>
 
  my $html = $qdb->get_record_as_html("bdb5rjd6h", 27);
- 
- # Prints HTML output, including css style information, links to javascript 
+
+ # Prints HTML output, including css style information, links to javascript
  # files on QuickBase's server, and the table containing the record.
- print $html; 
+ print $html;
 
 =for comment ######################### get_record_info #########################
 
 =head2 get_record_info
 
-Invoking this call on a table-level dbid will return all the fields of a 
+Invoking this call on a table-level dbid will return all the fields of a
 record, similar to L</"do_query"> with all fields specified.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3213,11 +3285,11 @@ Currently returns unprocessed XML response.
 B<Example(s)>
 
  my $xml = $qdb->get_record_info("bdcagynhs", 27);
- 
+
  print $xml;
- 
+
  ###################################################
- 
+
  Prints:
  <?xml version="1.0" ?>
  <qdbapi>
@@ -3227,7 +3299,7 @@ B<Example(s)>
  <rid>20</rid>
  <num_fields>28</num_fields>
  <update_id>1205780029699</update_id>
- 
+
  <field>
  <fid>6</fid>
  <name>user</name>
@@ -3254,7 +3326,7 @@ Used to retrieve a list of record IDs in a table.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3269,9 +3341,9 @@ Array of record IDs.
 B<Example(s)>
 
  my @rids = $qdb->get_rids("bdb5rjd6h");
- 
+
  print join(", ", @rids);
- 
+
  # Prints: 1, 2, 3, 4, etc.
 
 =for comment ######################### get_role_info #########################
@@ -3280,9 +3352,9 @@ B<Example(s)>
 
 Use this method to get all of the roles that apply to an application.
 
-Each application can have its own set or foles that govern user access to that 
-application.  To find out what roles are available in an application, you can 
-invoke this method to return all of the roles and their information (name, ID, 
+Each application can have its own set or foles that govern user access to that
+application.  To find out what roles are available in an application, you can
+invoke this method to return all of the roles and their information (name, ID,
 application access level).
 
 The access level returned is one of these available access types:
@@ -3299,7 +3371,7 @@ The access level returned is one of these available access types:
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3336,7 +3408,7 @@ B<Example(s)>
 
  # Retrieve the array of roles
  my @roles = $qdb->get_role_info("bddrqepes");
- 
+
  # Print a list of role names and their access level
  foreach my $role (@roles){
      print $role{"name"}.": ".$role{"access"}."\n";
@@ -3346,17 +3418,17 @@ B<Example(s)>
 
 =head2 get_schema
 
-If you invoke this method on an application-level dbid it will return 
-information about the application, such as any DBVars created for it and all 
+If you invoke this method on an application-level dbid it will return
+information about the application, such as any DBVars created for it and all
 child table dbids available.
 
-If you invoke this method on a table-level dbid the DBVars are also listed, but 
-there will additionally be table-related information such as queries, field IDs 
+If you invoke this method on a table-level dbid the DBVars are also listed, but
+there will additionally be table-related information such as queries, field IDs
 (fids), and the current property settings for each field.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3366,7 +3438,7 @@ An application-level or table-level QuickBase database ID.
 
 B<Returns>
 
-A detailed hash object containing the application or table schema in the 
+A detailed hash object containing the application or table schema in the
 following format:
 
  {
@@ -3386,13 +3458,13 @@ following format:
          "Magenta" => 12,
          "usercode" => 14
      },
-     
+
      # Available only in application-level dbids
      "chdbids" => {
          "_dbid_sample_database" => "bdb5rjd6g",
          "_dbid_pronouns" => "bddrydqhg"
      },
-     
+
      # Available only in table-level dbids
      "queries" => {
          "by_id" => {
@@ -3411,12 +3483,16 @@ following format:
                  "qycalst" => 0.0
              }
          }
+     },
+
+     "fields" => {
+         ...
      }
  }
 
 B<Example(s)>
 
- # Example code goes here
+ my $schema = $qdb->get_schema("bdb5rjd6h");
 
 =for comment ######################### get_ticket #########################
 
@@ -3447,30 +3523,30 @@ B<Example(s)>
 
 =head2 get_user_info
 
-You invoke this method to get the user name and userid associated with the 
-specified email address (used for QuickBase login).  This call is useful in 
-the contet of granting a user access rights to your application and then 
-inviting that user to your application.  This call is typically made to return 
-the QuickBase userid for a user whose email address you know, in preparation 
-for subsequent calls to L</"add_user_to_role"> (grant access rights) and 
+You invoke this method to get the user name and userid associated with the
+specified email address (used for QuickBase login).  This call is useful in
+the contet of granting a user access rights to your application and then
+inviting that user to your application.  This call is typically made to return
+the QuickBase userid for a user whose email address you know, in preparation
+for subsequent calls to L</"add_user_to_role"> (grant access rights) and
 L</"send_invitation">, both of which require the userid.
 
-The user email you specify must be recognized in QuickBase or this call won't 
-work.  For users not registered with QuickBase use the alternative 
+The user email you specify must be recognized in QuickBase or this call won't
+work.  For users not registered with QuickBase use the alternative
 L</"provision_user">.
 
-If the email parameter is not supplied the ticket will be used to determine 
-the user, and information for the currently authenticated user will be 
+If the email parameter is not supplied the ticket will be used to determine
+the user, and information for the currently authenticated user will be
 returned.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * [optional] Email
 
-Email address of the registered QuickBase user for whom you wish to retrieve 
-information.  If omitted, the currently authenticated user's information will 
+Email address of the registered QuickBase user for whom you wish to retrieve
+information.  If omitted, the currently authenticated user's information will
 be returned.
 
 =back
@@ -3491,22 +3567,22 @@ A hash object of the following format:
 B<Example(s)>
 
  my %user_info = $qdb->get_user_info("rlodbrok@paris.net");
- 
+
  print $user_info{'id'}; # Prints "112149.bhsv"
 
 =for comment ######################### get_user_roles #########################
 
 =head2 get_user_roles
 
-You invoke this method on an application-level dbid to find out what roles are 
+You invoke this method on an application-level dbid to find out what roles are
 currently assigned to a specific user in an application.
 
-In contrast, the similar L</"user_roles"> casts a bigger net, getting all users and 
+In contrast, the similar L</"user_roles"> casts a bigger net, getting all users and
 their roles for the specified application.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3539,9 +3615,9 @@ A hash object of the following format:
 B<Example(s)>
 
  my %user_roles = $qdb->get_user_roles("57pa5vjf","112245.efy7");
- 
+
  while my $role (@{$user_roles{'roles'}}){
-     
+
      # Prints "Viewer: Basic Access"
      print $role->{'name'}.": ".$role->{'access'}."\n";
  }
@@ -3550,14 +3626,14 @@ B<Example(s)>
 
 =head2 granted_dbs
 
-You invoke this method to get the names and dbids of all the applications and 
-tables that you are able to access.  Optionally, you can choose to retrieve 
-parent applications, child tables, or both, or restrict the list to only those 
+You invoke this method to get the names and dbids of all the applications and
+tables that you are able to access.  Optionally, you can choose to retrieve
+parent applications, child tables, or both, or restrict the list to only those
 applications and tables to which you have administrative rights.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * [optional] Include Applications
 
@@ -3569,7 +3645,7 @@ Set this parameter to 1 to include tables in the response.
 
 =item * [optional] Filter for Administrative Rights
 
-Set this parameter to 1 to only show the applications and/or tables for which 
+Set this parameter to 1 to only show the applications and/or tables for which
 administrative rights have been granted.
 
 =back
@@ -3606,7 +3682,7 @@ An array of the following format:
 B<Example(s)>
 
  my @databases = $qdb->granted_dbs(1,1);
- 
+
  foreach my $db(@databases){
      print "$db->{'dbname'}: $db->{'dbid'}\n"; # Prints "Misc_Comments: bdadur4ak", etc.
  }
@@ -3615,27 +3691,27 @@ B<Example(s)>
 
 =head2 import_from_csv
 
-You invoke this method on a table-level dbid to add or update a batch of 
-records.  You can even do adds and edits together in the same import_from_csv 
-call.  (For an add, leave the RecordID empty -- that's how QuickBase knows it's 
+You invoke this method on a table-level dbid to add or update a batch of
+records.  You can even do adds and edits together in the same import_from_csv
+call.  (For an add, leave the RecordID empty -- that's how QuickBase knows it's
 an add.)
 
-In comparison, L</"add_record"> and L</"edit_record"> will only let you add or edit one 
-record at a time.  There is one limitation, though: you can't use this call to 
+In comparison, L</"add_record"> and L</"edit_record"> will only let you add or edit one
+record at a time.  There is one limitation, though: you can't use this call to
 modify file attachment fields.
 
-The clist parameter is optional when adding new records to a table.  However, 
-when updating existing records, you must specify the clist parameter. QuickBase 
-uses this parameter to determine whether new records to a table or existing 
+The clist parameter is optional when adding new records to a table.  However,
+when updating existing records, you must specify the clist parameter. QuickBase
+uses this parameter to determine whether new records to a table or existing
 records are being updated.
 
-For an edit operation, the clist parameter must contain the field ID for the 
-Record ID# field.  Also, the CSV must include a column that contains a record 
+For an edit operation, the clist parameter must contain the field ID for the
+Record ID# field.  Also, the CSV must include a column that contains a record
 id for each record that you are updating.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3647,8 +3723,8 @@ The comma-separated input data.
 
 =item * [optional] Column List (clist)
 
-A period delimited list of field IDs to which the CSV columns map.  This means 
-that the first field ID in the list maps to the first column in the CSV file, 
+A period delimited list of field IDs to which the CSV columns map.  This means
+that the first field ID in the list maps to the first column in the CSV file,
 the second ID maps to the second column in the CSV file, and so forth.
 
 To prevent a column in the CSV file from being imported, enter a 0 in the field list.
@@ -3656,22 +3732,22 @@ To prevent a column in the CSV file from being imported, enter a 0 in the field 
 Examples:
 
  In the following examples, the CSV file contains 4 columns
- 
+
  "0.7.0.6"
- In this example, QuickBase will not import either the first or the third 
+ In this example, QuickBase will not import either the first or the third
  columns in the CSV file.
- 
+
  "7.8.5"
- In this example the field ID of 7 is mapped to the first column in the CSV 
- file, the field with a field ID of 8 is mapped to the second column, and 
- the field id of 5 is mapped to the third column.  Since the clist parameter 
- does not include a fourth field ID, the fourth column in the CSV file is 
+ In this example the field ID of 7 is mapped to the first column in the CSV
+ file, the field with a field ID of 8 is mapped to the second column, and
+ the field id of 5 is mapped to the third column.  Since the clist parameter
+ does not include a fourth field ID, the fourth column in the CSV file is
  ignored.
 
 =item * [optional] Skip First
 
-This parameter prevents QuickBase from importing the first row of data in a CSV 
-file.  You must set this parameter to 1 if the first row of your CSV contains 
+This parameter prevents QuickBase from importing the first row of data in a CSV
+file.  You must set this parameter to 1 if the first row of your CSV contains
 column names.
 
 =back
@@ -3688,20 +3764,20 @@ B<Example(s)>
 
 =head2 post_api
 
-A (mostly) private method for direct communication with the QuickBase API.  The 
-post_api method will take a parameter list and convert it into the requisite 
-XML for a request, including the authentication and header information 
-automatically.  It returns an HTTP::Response object, after checking its 
-contents for error information  which is stored in the L</"error"> and 
+A (mostly) private method for direct communication with the QuickBase API.  The
+post_api method will take a parameter list and convert it into the requisite
+XML for a request, including the authentication and header information
+automatically.  It returns an HTTP::Response object, after checking its
+contents for error information  which is stored in the L</"error"> and
 L</"errortext"> properties if found.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
-A QuickBase application- or table-level dbid.  ("main" should be used for API 
+A QuickBase application- or table-level dbid.  ("main" should be used for API
 calls which do not require a database.)
 
 =item * QuickBase Action
@@ -3714,7 +3790,7 @@ A hash or array list of parameters to be sent to QuickBase.
 
 =item * [optional] Headers
 
-A hash list of headers to send to QuickBase.  Basic headers such as 
+A hash list of headers to send to QuickBase.  Basic headers such as
 Content-Type and QUICKBASE-ACTION are set automatically.
 
 =back
@@ -3726,9 +3802,9 @@ An HTTP::Response object containing the response from QuickBase.
 B<Example(s)>
 
  my $response = $qdb->post_api("bddrqepes", "API_GetDBvar", {"varname"=>"usercode"});
- 
+
  print $response->content;
- 
+
  # Prints:
  <?xml version="1.0" ?>
  <qdbapi>
@@ -3742,12 +3818,12 @@ B<Example(s)>
 
 =head2 provision_user
 
-This method is invoked on an application-level dbid for a user that is not yet 
+This method is invoked on an application-level dbid for a user that is not yet
 registered with QuickBase, but whose email is known to you.  This call will:
 
 =over
 
-=item * Start a new user registration in QuickBase using the supplied email, 
+=item * Start a new user registration in QuickBase using the supplied email,
 first name, and last name.
 
 =item * Give application access to the user by adding the user to the specified
@@ -3755,22 +3831,22 @@ role.
 
 =back
 
-After you invoke this method, you'll need to invoke L</"send_invitation"> to invite 
-the new user via email.  When the user clicks on the link in the email 
-invitation, the user is prompted to complete the brief registration.  At this 
+After you invoke this method, you'll need to invoke L</"send_invitation"> to invite
+the new user via email.  When the user clicks on the link in the email
+invitation, the user is prompted to complete the brief registration.  At this
 time, the user can change the first and last name you assigned.
 
-If a user is already registered with QuickBase, you can't use this call.  
-Instead, to do these same tasks you'll have to use L</"get_user_info">, 
+If a user is already registered with QuickBase, you can't use this call.
+Instead, to do these same tasks you'll have to use L</"get_user_info">,
 L</"add_user_to_role">, and L</"send_invitation">.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
-The application-level dbid of the QuickBase application you wish to grant the 
+The application-level dbid of the QuickBase application you wish to grant the
 user access to.
 
 =item * Email
@@ -3787,7 +3863,7 @@ The last name of the new QuickBase user.
 
 =item * [optional] Role ID
 
-The role ID of the role you want to assign the user to.  If you don't supply a 
+The role ID of the role you want to assign the user to.  If you don't supply a
 role, the role will be set to 'none'.  This can be found via L</"get_role_info">.
 
 =back
@@ -3799,7 +3875,7 @@ The userid of the newly created user.
 B<Example(s)>
 
  my $new_userid = $qdb->provision_user("bdcagynhs", "sanskor@sbcglobal.com", "Margi", "Rita" 10);
- 
+
  print $new_userid; # Prints "112248.5nzg"
 
 =for comment ######################### proxy #########################
@@ -3810,7 +3886,7 @@ Gets and sets the proxy for LWP::UserAgent to use when making API calls.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * [optional] Proxy Address
 
@@ -3827,9 +3903,9 @@ B<Example(s)>
 =begin html
 
 <PRE> print $qdb->proxy(); # Prints ""
- 
+
  $qdb->proxy("http://myproxy.com:8080");
- 
+
  print $qdb->proxy(); #Prints "http://myproxy.com:8080"</PRE>
 
 =end html
@@ -3840,19 +3916,19 @@ B<Example(s)>
 
 =for html <strong style="color:red">CAUTION: Use this method carefully!</strong>
 
-The purge_records method is used to delete several records at once, and has the 
-potential to completely wipe out a table if the query parameter is omitted or 
+The purge_records method is used to delete several records at once, and has the
+potential to completely wipe out a table if the query parameter is omitted or
 empty.
 
-You invoke this call on the table-level dbid of the table you want to delete 
-the records from.  If you only need to delete one record, L</"delete_record"> 
+You invoke this call on the table-level dbid of the table you want to delete
+the records from.  If you only need to delete one record, L</"delete_record">
 would be a better choice.
 
 All records matching your query criteria will be deleted.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -3874,7 +3950,7 @@ The ID (qid) of the pre-built query you wish to execute.
 
 =item * Query String
 
-The custom query built using the language specified at 
+The custom query built using the language specified at
 http://member.developer.intuit.com/MyIDN/technical_resources/quickbase/framework/httpapiref/HTML_API_Programmers_Guide.htm
 under Building and Using Queries.
 
@@ -3889,7 +3965,7 @@ The number of records deleted.
 B<Example(s)>
 
  my $num_deleted = $qdb->purge_records("bddrqepes", "{'7'.CT.'Company B'}");
- 
+
  print "$num_deleted record(s) deleted.";
 
 =for comment ######################### realmhost #########################
@@ -3900,7 +3976,7 @@ Gets and sets the realmhost to use when accessing QuickBase.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * [optional] Realmhost
 
@@ -3917,9 +3993,9 @@ B<Example(s)>
 =begin html
 
 <PRE> print $qdb->realmhost(); # Prints ""
- 
+
  $qdb->realmhost("http://mycompany.quickbase.com");
- 
+
  print $qdb->realmhost(); # Prints "http://mycompany.quickbase.com"</PRE>
 
 =end html
@@ -3928,33 +4004,33 @@ B<Example(s)>
 
 =head2 remove_user_from_role
 
-You invoke this method on an application-level dbid to remove the user entirely 
-from the specified role in that application.  Keep in mind that if the user has 
-no other role, it eliminates the user entirely from the application's role list.  
-This means that calling L</"user_roles"> won't return the user at all, so 
-you'll need to get the userid by calling L</"get_user_info"> if you want to 
+You invoke this method on an application-level dbid to remove the user entirely
+from the specified role in that application.  Keep in mind that if the user has
+no other role, it eliminates the user entirely from the application's role list.
+This means that calling L</"user_roles"> won't return the user at all, so
+you'll need to get the userid by calling L</"get_user_info"> if you want to
 assign the user to another role in the future.
 
-This method can be used to remove the user entirely from any role in the 
-application, effectively turning off access to that user.  If you intend to 
-turn off all access, you would need to call L</"get_user_roles"> to see what 
+This method can be used to remove the user entirely from any role in the
+application, effectively turning off access to that user.  If you intend to
+turn off all access, you would need to call L</"get_user_roles"> to see what
 roles the user has, then invoke L</"remove_user_from_role"> on each role.
 
-If you expect to add that user to another role in the future, you should 
-consider using L</"change_user_role">, which can be used to turn off access 
-with a role set to None while keeping the user on the application's role list 
+If you expect to add that user to another role in the future, you should
+consider using L</"change_user_role">, which can be used to turn off access
+with a role set to None while keeping the user on the application's role list
 for future reinstatement or role change.
 
-If you are simply changing the user from one role to another, you should use 
+If you are simply changing the user from one role to another, you should use
 L</"change_user_role">.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
-Application-level dbid of the application containing the role you want to 
+Application-level dbid of the application containing the role you want to
 remove the user from.
 
 =item * User ID
@@ -3979,13 +4055,13 @@ B<Example(s)>
 
 =head2 rename_app
 
-You invoke this method on an application-level dbid to change the application 
-name.  No dbids, fids, or anything other than the application name is affected.  
+You invoke this method on an application-level dbid to change the application
+name.  No dbids, fids, or anything other than the application name is affected.
 You must have administrator rights to call this.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -4017,14 +4093,14 @@ B<See Also:> L</"add_replace_db_page">, L</"add_db_page">
 
 =head2 send_invitation
 
-You invoke this method to send an email invitation for your application.  The 
-userid is either from an existing QuickBase user that you have granted access 
-to via L</"add_user_to_role">, or from a new QuickBase user that you have 
+You invoke this method to send an email invitation for your application.  The
+userid is either from an existing QuickBase user that you have granted access
+to via L</"add_user_to_role">, or from a new QuickBase user that you have
 created via L</"provision_user">.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -4052,17 +4128,17 @@ B<Example(s)>
 
 =head2 set_db_var
 
-If you have administrator rights in an aplication, you can invoke this method 
-to create a DBVar variable and/or set a value for it.  If the DBVar already 
-exists, this call will overwrite the existing value.  You can only invoke this 
+If you have administrator rights in an aplication, you can invoke this method
+to create a DBVar variable and/or set a value for it.  If the DBVar already
+exists, this call will overwrite the existing value.  You can only invoke this
 call on one DBVar at a time.
 
-DBVars can only be set at the application level, so you must specify an 
+DBVars can only be set at the application level, so you must specify an
 application-level dbid.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -4090,19 +4166,19 @@ B<Example(s)>
 
 =head2 set_field_properties
 
-You invoke this method on a table-level dbid to set one or more properties of a 
-field.  Normally, you use this call after you create a new field using 
-L</"add_field">, to set up its default behavior, however you can also use this 
-call any time you want to change properties, even if the affected field has 
+You invoke this method on a table-level dbid to set one or more properties of a
+field.  Normally, you use this call after you create a new field using
+L</"add_field">, to set up its default behavior, however you can also use this
+call any time you want to change properties, even if the affected field has
 data.
 
-The properties available for a field vary slightly for different field types.  
-To get all of the available properties for a field, and to get the field id 
+The properties available for a field vary slightly for different field types.
+To get all of the available properties for a field, and to get the field id
 (fid) needed, use the L</"get_schema"> method.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -4114,7 +4190,7 @@ The field ID of the field to modify.
 
 =item * Properties
 
-A hash reference containing a list of properties and values to change.  For a 
+A hash reference containing a list of properties and values to change.  For a
 complete list of field properties, see the link below.
 
 http://member.developer.intuit.com/MyIDN/technical_resources/quickbase/framework/httpapiref/QBaseSDK_/04_API_LangRef/04_API_LangRef-168.htm
@@ -4128,25 +4204,25 @@ True/False value for success/failure.
 B<Example(s)>
 
  my $success = $qdb=>set_field_properties("bddrqepes", 15, {"default_value" => "Hello"});
- 
+
  print "Default value changed" if $success;
 
 =for comment ######################### user_roles #########################
 
 =head2 user_roles
 
-You invoke this method to find out details about an application's users and 
-their roles.  You have to use the application-level dbid; a table-level dbid 
+You invoke this method to find out details about an application's users and
+their roles.  You have to use the application-level dbid; a table-level dbid
 returns an error.
 
-This method returns all users and their roles.  In contrast, 
+This method returns all users and their roles.  In contrast,
 L</"get_user_role"> gets only the roles for a specified user.
 
 You can invoke this method if you have basic access rights or higher.
 
 B<Parameters>
 
-=over 
+=over
 
 =item * QuickBase Database ID
 
@@ -4178,9 +4254,9 @@ An array of the following format:
 B<Example(s)>
 
  my @user_roles = $qdb->user_roles("bddrqepes");
- 
+
  my $num_users = $#user_roles;
- 
+
  foreach my $user (@user_roles){
      print "User ID: $user->{'id'}\n";
      print "User Name: $user->{'name'}\n";
@@ -4194,7 +4270,7 @@ B<Example(s)>
      print "\n";
  }
 
-=for comment 
+=for comment
 ###############################################################################
 #                                                                             #
 #                                 DEPRECATED                                  #
@@ -4203,7 +4279,7 @@ B<Example(s)>
 
 =head1 DEPRECATED
 
-These methods are no longer preferred.  They will be phased out in future 
+These methods are no longer preferred.  They will be phased out in future
 versions of the SDK.
 
 =head2 addField
