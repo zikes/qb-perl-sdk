@@ -28,7 +28,6 @@ package HTTP::QuickBase;
 use strict;
 use LWP::UserAgent;
 use MIME::Base64 qw(encode_base64);
-use Data::Dumper;
 
 my %xml_escapes;
 
@@ -186,8 +185,6 @@ sub post_api{
 
     my $process_param = sub {
         my ($tag,$value,$atts) = @_;
-
-        # if($self->{'debug'}){print "--------\nTag: ".Dumper($tag)."\nValue: ".Dumper($value)."\nAtts: ".Dumper($atts)."\n";}
 
         $tag = $tag || "field";
 
@@ -384,8 +381,6 @@ sub gen_results_table{
     my ($self, $db, $query, $clist, $slist, $jht, $jsa, $options) = @_;
 
     my %hash;
-
-
 
     if(ref($query) eq "HASH"){
         $hash{'query'} = $query->{query} if defined($query->{query});
@@ -1507,7 +1502,6 @@ HTTP::QuickBase - Create a web shareable database in under a minute
  $clone_name = "My Guest Book";
 
  $database_clone_id = $qdb->clone_database($database_id, $clone_name, "Description of my new database.");
-
 
  # Let's put something into the new guest book
  $record_id = $qdb->add_record(
